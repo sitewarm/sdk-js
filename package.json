@@ -1,0 +1,45 @@
+{
+  "name": "@sitewarm/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for the sitewarm API (typed from the OpenAPI spec, zero runtime dependencies).",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "openapi/openapi.yaml",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5",
+    "yaml": "2.9.1"
+  },
+  "packageManager": "pnpm@11.0.9",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sitewarm/sdk-js.git"
+  },
+  "homepage": "https://github.com/sitewarm/sdk-js#readme",
+  "bugs": "https://github.com/sitewarm/sdk-js/issues"
+}
