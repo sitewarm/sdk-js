@@ -30,6 +30,16 @@ export class SiteWarmTimeoutError extends SiteWarmConnectionError {
   override name = "SiteWarmTimeoutError";
 }
 
+/** The response body was larger than the SDK reads (32 MiB). Not retried. */
+export class SiteWarmResponseTooLargeError extends SiteWarmError {
+  override name = "SiteWarmResponseTooLargeError";
+  readonly limit: number;
+  constructor(limit: number) {
+    super(`response body is larger than ${limit} bytes`);
+    this.limit = limit;
+  }
+}
+
 /** The API answered with a non-2xx status. */
 export class SiteWarmApiError extends SiteWarmError {
   override name = "SiteWarmApiError";

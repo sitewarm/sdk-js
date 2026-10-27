@@ -2,6 +2,7 @@ import { operationTable } from "./generated/operations.js";
 import {
   SiteWarmConnectionError,
   SiteWarmError,
+  SiteWarmResponseTooLargeError,
   SiteWarmTimeoutError,
   apiErrorFor,
   type Problem,
@@ -42,6 +43,11 @@ export interface SiteWarmOptions {
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_TIMEOUT_MS = 30_000;
+/** Largest response body that is read (32 MiB). */
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_PAGES = 10_000;
+const REPEATABLE = new Set(["GET", "HEAD", "PUT", "OPTIONS"]);
 
 /**
  * Typed client for the sitewarm public API.
@@ -77,10 +83,13 @@ export class SiteWarm {
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== "function") throw new SiteWarmError("no fetch implementation available; pass options.fetch");
     this.#fetch = f;
-    this.#maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+    // A negative maxRetries or a timeoutMs <= 0 keeps the default.
+    this.#maxRetries =
+      typeof options.maxRetries === "number" && options.maxRetries >= 0 ? Math.floor(options.maxRetries) : DEFAULT_MAX_RETRIES;
     this.#retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
     this.#maxRetryDelayMs = options.maxRetryDelayMs ?? 30_000;
-    this.#timeoutMs = options.timeoutMs ?? 30_000;
+    this.#timeoutMs =
+      typeof options.timeoutMs === "number" && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
     this.#userAgent = options.userAgent;
     const resources = createResources(this);
     this.sites = resources.sites;
@@ -107,7 +116,7 @@ export class SiteWarm {
       idempotencyKey?: string;
       signal?: AbortSignal;
     };
-    const url = this.#baseUrl + expandPath(op.path, a.path) + queryString(a.query);
+    const url = this.#baseUrl + expandPath(op.path, a.path) + queryString(checkedQuery(a.query));
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.#apiKey}`,
@@ -123,9 +132,10 @@ export class SiteWarm {
     const sendsKey = op.idempotency !== "none" && op.method === "POST";
     if (sendsKey) headers["Idempotency-Key"] = a.idempotencyKey ?? crypto.randomUUID();
 
-    // 429 means the request was not processed. 5xx and network errors may have been, so they are only
-    // retried when repeating the request is safe: not a POST, or a POST carrying an Idempotency-Key.
-    const safeToRetryAmbiguous = op.method !== "POST" || sendsKey;
+    // 429 means the request was not processed. 5xx, network errors and broken bodies may have been, so they are
+    // only retried when repeating is safe: GET, HEAD, PUT, OPTIONS, or a POST carrying an Idempotency-Key.
+    // DELETE and PATCH are retried on 429 only.
+    const safeToRetryAmbiguous = REPEATABLE.has(op.method) || sendsKey;
 
     for (let attempt = 0; ; attempt++) {
       const last = attempt >= this.#maxRetries;
@@ -150,7 +160,30 @@ export class SiteWarm {
           : new SiteWarmConnectionError(`request failed: ${err instanceof Error ? err.message : "network error"}`, { cause: err });
       }
 
-      if (response.ok) return { data: await parseBody(response), status: response.status, headers: response.headers };
+      if (response.redirected || response.type === "opaqueredirect") {
+        // The supplied fetch ignored redirect: "manual". Authorization may already have left; do not continue.
+        await discard(response);
+        throw new SiteWarmError("the fetch implementation followed a redirect; it must honor redirect: 'manual'");
+      }
+
+      let text: string;
+      try {
+        text = await readBody(response);
+      } catch (err) {
+        if (err instanceof SiteWarmResponseTooLargeError) throw err;
+        if (a.signal?.aborted) throw a.signal.reason ?? err;
+        // A body that breaks off is as ambiguous as a network error, except after a 429.
+        if (!last && (safeToRetryAmbiguous || response.status === 429)) {
+          await sleep(backoffDelayMs(attempt, this.#retryBaseDelayMs, this.#maxRetryDelayMs), a.signal);
+          continue;
+        }
+        const timedOut = err instanceof Error && err.name === "TimeoutError";
+        throw timedOut
+          ? new SiteWarmTimeoutError(`request timed out after ${this.#timeoutMs} ms`, { cause: err })
+          : new SiteWarmConnectionError(`response body failed: ${err instanceof Error ? err.message : "network error"}`, { cause: err });
+      }
+
+      if (response.ok) return { data: parseBody(text, response.status), status: response.status, headers: response.headers };
 
       const retryAfter = parseRetryAfter(response.headers.get("Retry-After"));
       const retryable = response.status === 429 || (response.status >= 500 && response.status !== 501 && safeToRetryAmbiguous);
@@ -158,14 +191,13 @@ export class SiteWarm {
         // A server-provided wait longer than we are willing to sleep is surfaced instead of ignored.
         const waitMs = retryAfter !== undefined ? retryAfter * 1000 : backoffDelayMs(attempt, this.#retryBaseDelayMs, this.#maxRetryDelayMs);
         if (waitMs <= this.#maxRetryDelayMs) {
-          await discard(response);
           await sleep(waitMs, a.signal);
           continue;
         }
       }
       throw apiErrorFor({
         status: response.status,
-        problem: await parseProblem(response),
+        problem: parseProblem(text, response),
         retryAfterSeconds: retryAfter,
         rateLimit: readRateLimit(response.headers),
       });
@@ -178,8 +210,9 @@ export class SiteWarm {
     args: CallArgs<K> = {} as CallArgs<K>,
     options: { maxPages?: number } = {},
   ): AsyncGenerator<ResponseData<K>, void, undefined> {
-    const maxPages = options.maxPages ?? 10_000;
+    const maxPages = options.maxPages ?? MAX_PAGES;
     let cursor = (args as { query?: { cursor?: string } }).query?.cursor;
+    const seen = new Set<string>(cursor ? [cursor] : []);
     for (let n = 0; n < maxPages; n++) {
       const query = { ...(args as { query?: object }).query, ...(cursor ? { cursor } : {}) };
       const page = (await this.call(operationId, { ...args, query } as CallArgs<K>)) as {
@@ -188,9 +221,11 @@ export class SiteWarm {
       yield page as ResponseData<K>;
       const next = page.page.next_cursor;
       if (!page.page.has_more || !next) return;
-      if (next === cursor) throw new SiteWarmError("pagination cursor did not advance");
+      if (seen.has(next)) throw new SiteWarmError("pagination cursor did not advance");
+      seen.add(next);
       cursor = next;
     }
+    throw new SiteWarmError(`pagination stopped after ${maxPages} pages without reaching the end`);
   }
 
   /** Iterates every item of a list operation across pages. */
@@ -258,21 +293,54 @@ async function discard(response: Response): Promise<void> {
   }
 }
 
-async function parseBody<T>(response: Response): Promise<T> {
-  if (response.status === 204) return undefined as T;
-  const text = await response.text();
-  if (text === "") return undefined as T;
+/** Reads at most MAX_BODY_BYTES + 1 bytes; a larger body throws SiteWarmResponseTooLargeError (not retried). */
+async function readBody(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new SiteWarmResponseTooLargeError(MAX_BODY_BYTES);
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    all.set(c, off);
+    off += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+
+/** `limit` must be an integer in 1..100 (0 or undefined = server default, not sent). */
+function checkedQuery(query: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!query || !("limit" in query)) return query;
+  const { limit, ...rest } = query;
+  if (limit === undefined || limit === null || limit === 0) return rest;
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new SiteWarmError("limit must be an integer between 1 and 100");
+  }
+  return query;
+}
+
+function parseBody<T>(text: string, status: number): T {
+  if (status === 204 || text === "") return undefined as T;
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new SiteWarmError(`invalid JSON in ${response.status} response`);
+    throw new SiteWarmError(`invalid JSON in ${status} response`);
   }
 }
 
-async function parseProblem(response: Response): Promise<Problem> {
+function parseProblem(text: string, response: Response): Problem {
   const fallback: Problem = { type: "about:blank", title: response.statusText || `HTTP ${response.status}`, status: response.status };
   try {
-    const text = await response.text();
     const json: unknown = JSON.parse(text);
     if (json && typeof json === "object" && !Array.isArray(json)) {
       const p = json as Record<string, unknown>;
