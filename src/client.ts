@@ -1,6 +1,7 @@
 import { operationTable } from "./generated/operations.js";
 import {
   SiteWarmConnectionError,
+  SiteWarmDecodeError,
   SiteWarmError,
   SiteWarmResponseTooLargeError,
   SiteWarmTimeoutError,
@@ -9,6 +10,7 @@ import {
   type RateLimitInfo,
 } from "./errors.js";
 import { backoffDelayMs, parseRetryAfter, sleep } from "./retry.js";
+import { VERSION } from "./version.js";
 import { createResources, type Resources } from "./resources.js";
 import type {
   ApiResponse,
@@ -37,7 +39,7 @@ export interface SiteWarmOptions {
   maxRetryDelayMs?: number;
   /** Per-attempt timeout in ms. Default 30000. */
   timeoutMs?: number;
-  /** Sent as `User-Agent` when set (ignored by browsers). */
+  /** Sent as `User-Agent` (ignored by browsers). Default `sitewarm-js/<version> (+<repo URL>)`; an empty string keeps the default. */
   userAgent?: string;
 }
 
@@ -47,6 +49,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 /** Largest response body that is read (32 MiB). */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_PAGES = 10_000;
+const DEFAULT_USER_AGENT = `sitewarm-js/${VERSION} (+https://github.com/sitewarm/sdk-js)`;
 const REPEATABLE = new Set(["GET", "HEAD", "PUT", "OPTIONS"]);
 
 /**
@@ -71,7 +74,7 @@ export class SiteWarm {
   readonly #retryBaseDelayMs: number;
   readonly #maxRetryDelayMs: number;
   readonly #timeoutMs: number;
-  readonly #userAgent: string | undefined;
+  readonly #userAgent: string;
 
   constructor(options: SiteWarmOptions) {
     // Messages below never echo the key.
@@ -90,7 +93,7 @@ export class SiteWarm {
     this.#maxRetryDelayMs = options.maxRetryDelayMs ?? 30_000;
     this.#timeoutMs =
       typeof options.timeoutMs === "number" && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
-    this.#userAgent = options.userAgent;
+    this.#userAgent = options.userAgent || DEFAULT_USER_AGENT;
     const resources = createResources(this);
     this.sites = resources.sites;
     this.sitemaps = resources.sitemaps;
@@ -121,8 +124,8 @@ export class SiteWarm {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.#apiKey}`,
       Accept: "application/json, application/problem+json",
+      "User-Agent": this.#userAgent,
     };
-    if (this.#userAgent) headers["User-Agent"] = this.#userAgent;
     let body: string | undefined;
     if (a.body !== undefined) {
       body = JSON.stringify(a.body);
@@ -151,7 +154,7 @@ export class SiteWarm {
       } catch (err) {
         if (a.signal?.aborted) throw a.signal.reason ?? err;
         const timedOut = err instanceof Error && err.name === "TimeoutError";
-        if (!last && safeToRetryAmbiguous) {
+        if (!last && safeToRetryAmbiguous && isTransient(err)) {
           await sleep(backoffDelayMs(attempt, this.#retryBaseDelayMs, this.#maxRetryDelayMs), a.signal);
           continue;
         }
@@ -186,21 +189,30 @@ export class SiteWarm {
       if (response.ok) return { data: parseBody(text, response.status), status: response.status, headers: response.headers };
 
       const retryAfter = parseRetryAfter(response.headers.get("Retry-After"));
-      const retryable = response.status === 429 || (response.status >= 500 && response.status !== 501 && safeToRetryAmbiguous);
-      if (retryable && !last) {
-        // A server-provided wait longer than we are willing to sleep is surfaced instead of ignored.
-        const waitMs = retryAfter !== undefined ? retryAfter * 1000 : backoffDelayMs(attempt, this.#retryBaseDelayMs, this.#maxRetryDelayMs);
-        if (waitMs <= this.#maxRetryDelayMs) {
-          await sleep(waitMs, a.signal);
-          continue;
-        }
-      }
-      throw apiErrorFor({
+      const apiError = apiErrorFor({
         status: response.status,
         problem: parseProblem(text, response),
         retryAfterSeconds: retryAfter,
         rateLimit: readRateLimit(response.headers),
       });
+      let retryable = response.status === 429 || (response.status >= 500 && response.status !== 501 && safeToRetryAmbiguous);
+      // A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+      // "idempotency-key-reused" is a caller bug and is never retried.
+      if (response.status === 409 && sendsKey && apiError.code === "conflict") retryable = true;
+      if (retryable && !last) {
+        // Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+        // A server-provided wait longer than the cap is surfaced instead of slept.
+        const floored = retryAfter !== undefined ? Math.max(retryAfter * 1000, this.#retryBaseDelayMs) : undefined;
+        const waitMs =
+          floored !== undefined
+            ? Math.floor(floored * (1 + Math.random() / 4))
+            : backoffDelayMs(attempt, this.#retryBaseDelayMs, this.#maxRetryDelayMs);
+        if ((floored ?? waitMs) <= this.#maxRetryDelayMs) {
+          await sleep(waitMs, a.signal);
+          continue;
+        }
+      }
+      throw apiError;
     }
   }
 
@@ -246,6 +258,23 @@ export class SiteWarm {
   [Symbol.for("nodejs.util.inspect.custom")](): string {
     return `SiteWarm { baseUrl: '${this.#baseUrl}' }`;
   }
+}
+
+const NOT_TRANSIENT_CODES = /^(CERT_|ERR_TLS_CERT|UNABLE_TO_(GET|VERIFY)|SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED|HOSTNAME_MISMATCH|ERR_INVALID_|UND_ERR_INVALID|ENOTFOUND$|EAI_NONAME$|EAI_NODATA$)/;
+
+/**
+ * False for failures that repeating cannot fix: certificate verification, unknown host (DNS not found) and malformed
+ * requests (invalid header or URL). Other network errors are retried.
+ */
+export function isTransient(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let i = 0; i < 6 && cur instanceof Error; i++) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && NOT_TRANSIENT_CODES.test(code)) return false;
+    if (cur.name === "TypeError" && /invalid (header|url)|failed to parse url|invalid character/i.test(cur.message)) return false;
+    cur = cur.cause;
+  }
+  return true;
 }
 
 function normalizeBaseUrl(raw: string): string {
@@ -334,7 +363,7 @@ function parseBody<T>(text: string, status: number): T {
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new SiteWarmError(`invalid JSON in ${status} response`);
+    throw new SiteWarmDecodeError(status); // no cause: a parser message can quote the body
   }
 }
 

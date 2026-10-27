@@ -1,6 +1,7 @@
 export { SiteWarm, type SiteWarmOptions } from "./client.js";
 export type { WaitOptions } from "./resources.js";
 export * from "./errors.js";
+export { VERSION } from "./version.js";
 export { parseRetryAfter } from "./retry.js";
 export type {
   ApiResponse,

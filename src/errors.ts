@@ -40,6 +40,16 @@ export class SiteWarmResponseTooLargeError extends SiteWarmError {
   }
 }
 
+/** A 2xx response body was not valid JSON (for example an HTML page from a proxy). Never includes the body. */
+export class SiteWarmDecodeError extends SiteWarmError {
+  override name = "SiteWarmDecodeError";
+  readonly status: number;
+  constructor(status: number) {
+    super(`invalid JSON in ${status} response`);
+    this.status = status;
+  }
+}
+
 /** The API answered with a non-2xx status. */
 export class SiteWarmApiError extends SiteWarmError {
   override name = "SiteWarmApiError";

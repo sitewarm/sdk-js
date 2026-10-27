@@ -129,7 +129,8 @@ describe("retries", () => {
     vi.restoreAllMocks();
   });
 
-  it("honors Retry-After on 429 exactly", async () => {
+  it("honors Retry-After on 429 exactly (no jitter when random is 0)", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
     const f: FetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(problem(429, "rate-limited", { headers: { "Retry-After": "2" } }))
@@ -145,6 +146,7 @@ describe("retries", () => {
   });
 
   it("accepts an HTTP-date Retry-After", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
     vi.setSystemTime(new Date("2026-10-18T00:00:00Z"));
     const f: FetchMock = vi
       .fn<typeof fetch>()
